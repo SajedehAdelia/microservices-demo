@@ -1,66 +1,85 @@
 import os, json, redis, threading
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
-from flask_socketio import SocketIO, emit
-from google.cloud import pubsub_v1
+from google.cloud import tasks_v2, storage, firestore
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
+db = firestore.Client()
+r = redis.Redis(host=os.environ.get("REDIS_HOST", "127.0.0.1"), port=6379, decode_responses=True)
 
-# Config
+# Config from Environment Variables
 PROJECT_ID = "microservices-demo-adelia"
-TOPIC_ID = "td-redis-topic"
-# Each instance needs its OWN subscription name (passed via Env Var later)
-SUBSCRIPTION_ID = os.environ.get("SUBSCRIPTION_NAME")
+REGION = "europe-west1"
+SNAPSHOT_BUCKET = os.environ.get("SNAPSHOT_BUCKET")
+TASK_QUEUE = os.environ.get("TASK_QUEUE")
+PROCESSOR_URL = os.environ.get("PROCESSOR_URL")
+RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MIN", 5))
 
-r = redis.Redis(host=os.environ.get("REDIS_HOST", "127.0.0.1"), 
-                port=6379, decode_responses=True)
-SERVER_ID = os.environ.get("HOSTNAME", "local")
+tasks_client = tasks_v2.CloudTasksClient()
+storage_client = storage.Client()
 
-# Pub/Sub Setup
-publisher = pubsub_v1.PublisherClient()
-topic_path = publisher.topic_path(PROJECT_ID, TOPIC_ID)
+@app.before_request
+def rate_limit_middleware():
+    """Phase 4: Middleware for Rate Limiting"""
+    if request.path == "/publish" and request.method == "POST":
+        player_id = request.headers.get("X-Player-ID", "anonymous")
+        doc_ref = db.collection("rate_limits").document(player_id)
+        
+        @firestore.transactional
+        def check_and_update(transaction, doc_ref):
+            snapshot = doc_ref.get(transaction=transaction)
+            data = snapshot.to_dict() if snapshot.exists else {"count": 0, "window_start": datetime.now(timezone.utc).timestamp()}
+            
+            now = datetime.now(timezone.utc).timestamp()
+            if now - data["window_start"] > 60:
+                data = {"count": 1, "window_start": now}
+            elif data["count"] >= RATE_LIMIT:
+                return False
+            else:
+                data["count"] += 1
+            
+            transaction.set(doc_ref, data)
+            return True
 
-def callback(message):
-    """Triggered when a message arrives via Pub/Sub"""
-    event_key = message.data.decode("utf-8")
-    data = r.get(event_key)
-    if data:
-        # Push to all WebSockets connected to THIS instance
-        socketio.emit('update', json.loads(data))
-    message.ack() # Remove from queue [cite: 398]
-
-def listen_pubsub():
-    """Background thread to listen for events"""
-    if SUBSCRIPTION_ID:
-        subscriber = pubsub_v1.SubscriberClient()
-        sub_path = subscriber.subscription_path(PROJECT_ID, SUBSCRIPTION_ID)
-        streaming_pull_future = subscriber.subscribe(sub_path, callback=callback)
-        with subscriber:
-            try: streaming_pull_future.result()
-            except Exception as e: print(f"Listening failed: {e}")
+        if not check_and_update(db.transaction(), doc_ref):
+            return jsonify({"error": "Rate limit exceeded", "player_id": player_id}), 429
 
 @app.route("/publish", methods=["POST"])
 def publish():
-    msg_text = request.get_json().get("message")
-    entry = {"message": msg_text, "server_id": SERVER_ID, 
-             "published_at": datetime.now(timezone.utc).isoformat()}
-    key = f"event:{SERVER_ID}:{entry['published_at']}"
-    r.setex(key, 3600, json.dumps(entry))
-    # Notify other instances via Pub/Sub [cite: 400]
-    publisher.publish(topic_path, key.encode("utf-8"))
-    return jsonify({"status": "published", "data": entry})
+    data = request.get_json()
+    key = f"event:{os.environ.get('HOSTNAME', 'local')}:{datetime.now(timezone.utc).isoformat()}"
+    r.setex(key, 3600, json.dumps(data))
+    
+    # Cloud Tasks: Delegate snapshot saving
+    if TASK_QUEUE and PROCESSOR_URL:
+        parent = tasks_client.queue_path(PROJECT_ID, REGION, TASK_QUEUE)
+        task = {
+            "http_request": {
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": f"{PROCESSOR_URL}/process",
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"redis_key": key}).encode(),
+            }
+        }
+        tasks_client.create_task(request={"parent": parent, "task": task})
+    
+    return jsonify({"status": "published", "redis_key": key})
 
-@socketio.on('connect')
-def handle_connect():
-    """Send current state to new players [cite: 394]"""
-    result = []
-    cursor, keys = r.scan(match="event:*")
-    for k in keys:
-        val = r.get(k)
-        if val: result.append(json.loads(val))
-    emit('initial_state', {"server_id": SERVER_ID, "events": result})
+@app.route("/process", methods=["POST"])
+def process():
+    """Phase 3: Save to Cloud Storage"""
+    body = request.get_json()
+    key = body.get("redis_key")
+    val = r.get(key)
+    if val:
+        bucket = storage_client.bucket(SNAPSHOT_BUCKET)
+        blob = bucket.blob(f"snapshots/{key}.json")
+        blob.upload_from_string(val, content_type="application/json")
+    return jsonify({"status": "snapshot_saved"}), 200
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "healthy"})
 
 if __name__ == "__main__":
-    threading.Thread(target=listen_pubsub, daemon=True).start()
-    socketio.run(app, host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=8080)
